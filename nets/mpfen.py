@@ -1,479 +1,310 @@
-"""MPFEN 分割网络及裂缝感知特征提取、融合模块。"""
+"""Paper-first MPFEN. See README-LWTYPE.md for every underspecified choice.
 
-from functools import partial
-
-import os
-
-import cv2
-import numpy as np
+Standalone: this file does not import or modify the previous MPFEN implementation.
+Public entry: MPFENLWTYPE; returns two-class logits, not a thresholded mask.
+"""
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from PIL import Image
-
-from nets.mobilenetv2 import mobilenetv2
-from nets.xception import xception
+from torch import nn
+from torch.nn import functional as F
 
 
-class SEBlock(nn.Module):
-    """通过全局平均池化和全连接层生成通道注意力权重。"""
+def resize(x, size):
+    return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
-    def __init__(self, channel, reduction=16):
-        super(SEBlock, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
+
+class ConvBNReLU(nn.Sequential):
+    def __init__(self, cin, cout, kernel=1, stride=1, groups=1, dilation=1, relu6=False):
+        super().__init__(
+            nn.Conv2d(cin, cout, kernel, stride, padding=dilation*(kernel//2),
+                      dilation=dilation, groups=groups, bias=False),
+            nn.BatchNorm2d(cout),
+            nn.ReLU6(inplace=False) if relu6 else nn.ReLU(inplace=False),
         )
 
+
+class InvertedResidual(nn.Module):
+    """MobileNetV2 expansion -> depthwise -> linear projection, optional shortcut."""
+    def __init__(self, cin, cout, stride=1, expansion=6):
+        super().__init__()
+        hidden = cin * expansion
+        layers = []
+        if expansion != 1:
+            layers.append(ConvBNReLU(cin, hidden, relu6=True))
+        layers.extend([
+            ConvBNReLU(hidden, hidden, 3, stride, groups=hidden, relu6=True),
+            nn.Conv2d(hidden, cout, 1, bias=False), nn.BatchNorm2d(cout),
+        ])
+        self.branch = nn.Sequential(*layers)
+        self.residual = stride == 1 and cin == cout
+
     def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+        y = self.branch(x)
+        return x + y if self.residual else y
 
 
-class CrackAttentionModule(nn.Module):
-    """依次应用通道、空间和边缘注意力，并保存首个样本的特征热力图。"""
+class PaperBackbone(nn.Module):
+    """MobileNetV2 through the 96-channel stage; explicit 32->48 lateral adapter.
 
+    Output order follows the manuscript: F0 (coarse), F1, F2 (fine).
+    At 512: [N,96,32,32], [N,48,64,64], [N,24,128,128].
+    """
+    def __init__(self):
+        super().__init__()
+        self.stem = ConvBNReLU(3, 32, 3, 2, relu6=True)
+        stages, cin = [], 32
+        for expansion, cout, repeats, stride in [(1,16,1,1), (6,24,2,2),
+                                                (6,32,3,2), (6,64,4,2), (6,96,3,1)]:
+            blocks = []
+            for i in range(repeats):
+                blocks.append(InvertedResidual(cin, cout, stride if i == 0 else 1, expansion))
+                cin = cout
+            stages.append(nn.Sequential(*blocks))
+        self.stages = nn.ModuleList(stages)
+        self.middle_adapter = ConvBNReLU(32, 48)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stages[0](x)
+        f2 = self.stages[1](x)
+        raw_middle = self.stages[2](f2)
+        f1 = self.middle_adapter(raw_middle)
+        f0 = self.stages[4](self.stages[3](raw_middle))
+        return f0, f1, f2
+
+
+class SobelMagnitude(nn.Module):
+    """Fixed channelwise Sobel, registered as buffers so initialization cannot overwrite it."""
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("kx", torch.tensor([[-1.,0.,1.],[-2.,0.,2.],[-1.,0.,1.]])[None,None])
+        self.register_buffer("ky", torch.tensor([[-1.,-2.,-1.],[0.,0.,0.],[1.,2.,1.]])[None,None])
+
+    def forward(self, x):
+        c = x.shape[1]
+        padded = F.pad(x, (1,1,1,1), mode="replicate")
+        gx = F.conv2d(padded, self.kx.expand(c,1,3,3), groups=c)
+        gy = F.conv2d(padded, self.ky.expand(c,1,3,3), groups=c)
+        # vector_norm implements sqrt(gx^2+gy^2) with a finite zero subgradient.
+        return torch.linalg.vector_norm(torch.stack((gx, gy), dim=0), dim=0)
+
+
+class BPU(nn.Module):
+    """Eq.3 and following prose: cat(input, edge) -> 1x1 -> BN -> ReLU."""
     def __init__(self, channels):
-        super(CrackAttentionModule, self).__init__()
-        self.channel_attention = SEBlock(channels, reduction=8)
-
-        # 空间注意力（对应 DGG）
-        self.spatial_attention = nn.Sequential(
-            nn.Conv2d(channels, channels // 8, 1),
-            nn.BatchNorm2d(channels // 8),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 8, 1, 3, padding=1),
-            nn.Sigmoid()
-        )
-
-        # 边缘增强注意力（对应 BPU）
-        self.edge_attention = nn.Sequential(
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.BatchNorm2d(channels // 4),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 4, channels, 3, padding=1),
-            nn.Sigmoid()
-        )
-
-        # 保存目录与序号（每次 forward 自增）
-        self.save_dir = os.path.join("img", "MEFM")
-        os.makedirs(self.save_dir, exist_ok=True)
-        self._save_index = 0
-
-    def _composite(self, fmaps):
-        """对首个样本的通道绝对值取均值，归一化为 uint8 灰度图。"""
-        with torch.no_grad():
-            comp = fmaps.detach()
-            comp = comp.abs().mean(dim=1, keepdim=True)
-            comp = comp[0, 0]
-            minv, maxv = float(comp.min()), float(comp.max())
-            if maxv > minv:
-                comp = (comp - minv) / (maxv - minv + 1e-6)
-            else:
-                comp = torch.zeros_like(comp)
-            comp_np = (comp.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        return comp_np
-
-    def _save_heatmap(self, fmaps, name_prefix, idx_suffix):
-        """将合成特征映射为 JET 彩色热力图并保存。"""
-        comp_np = self._composite(fmaps)
-        heatmap = cv2.applyColorMap(comp_np, cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-        save_path = os.path.join(self.save_dir, f"{name_prefix}{idx_suffix}.png")
-        Image.fromarray(heatmap).save(save_path)
+        super().__init__()
+        self.sobel = SobelMagnitude()
+        self.fusion = ConvBNReLU(2*channels, channels)
 
     def forward(self, x):
-        """计算注意力特征，并以同一递增编号导出本次前向的热力图。"""
-        idx_suffix = f"_{self._save_index:06d}"
-
-        # TDE 输入
-        self._save_heatmap(x, "TDE_input", idx_suffix)
-        x_tde_out = self.channel_attention(x)
-        # TDE 输出
-        self._save_heatmap(x_tde_out, "TDE_output", idx_suffix)
-
-        # DGG 输入
-        self._save_heatmap(x_tde_out, "DGG_input", idx_suffix)
-        spatial_weight = self.spatial_attention(x_tde_out)
-        x_dgg_out = x_tde_out * spatial_weight
-
-        # 保存空间注意力调制后的 HSA 特征。
-        self._save_heatmap(x_dgg_out, "HSA_output", idx_suffix)
-
-        # BPU 输入
-        self._save_heatmap(x_dgg_out, "BPU_input", idx_suffix)
-        edge_weight = self.edge_attention(x_dgg_out)
-        x_bpu_out = x_dgg_out * edge_weight
-        # BPU 输出
-        self._save_heatmap(x_bpu_out, "BPU_output", idx_suffix)
-
-        self._save_index += 1
-        return x_bpu_out
+        return self.fusion(torch.cat((x, self.sobel(x)), dim=1))
 
 
-class MobileNetV2(nn.Module):
-    """按输出步幅配置空洞卷积的 MobileNetV2 特征提取器。"""
-
-    def __init__(self, downsample_factor=8, pretrained=True):
-        super(MobileNetV2, self).__init__()
-
-        # 在指定的 MobileNetV2 层中启用裂缝感知模块。
-        model = mobilenetv2(pretrained, crack_aware_layers=[10, 11, 12, 13, 14, 15, 16])
-        self.features = model.features[:-1]
-        self.total_idx = len(self.features)
-        self.down_idx = [2, 4, 7, 14]
-
-        if downsample_factor == 8:
-            for i in range(self.down_idx[-2], self.down_idx[-1]):
-                self.features[i].apply(
-                    partial(self._nostride_dilate, dilate=2)
-                )
-            for i in range(self.down_idx[-1], self.total_idx):
-                self.features[i].apply(
-                    partial(self._nostride_dilate, dilate=4)
-                )
-        elif downsample_factor == 16:
-            for i in range(self.down_idx[-1], self.total_idx):
-                self.features[i].apply(
-                    partial(self._nostride_dilate, dilate=2)
-                )
-
-    def _nostride_dilate(self, m, dilate):
-        """取消指定卷积的下采样，并调整 3×3 卷积的膨胀率与填充。"""
-        classname = m.__class__.__name__
-        if classname.find('Conv') != -1:
-            # 检查是否有stride属性
-            if hasattr(m, 'stride') and m.stride == (2, 2):
-                m.stride = (1, 1)
-                if hasattr(m, 'kernel_size') and m.kernel_size == (3, 3):
-                    m.dilation = (dilate // 2, dilate // 2)
-                    m.padding = (dilate // 2, dilate // 2)
-            else:
-                if hasattr(m, 'kernel_size') and m.kernel_size == (3, 3):
-                    m.dilation = (dilate, dilate)
-                    m.padding = (dilate, dilate)
+class DiagonalConv(nn.Module):
+    """Learned kernel with a permanent main-/anti-diagonal support mask."""
+    def __init__(self, cin, cout, kernel=7, anti=False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(cout, cin, kernel, kernel))
+        mask = torch.eye(kernel)
+        self.register_buffer("mask", (mask.flip(1) if anti else mask)[None,None])
+        self.padding = kernel // 2
+        nn.init.kaiming_normal_(self.weight, mode="fan_out", nonlinearity="relu")
 
     def forward(self, x):
-        """提取并返回浅层特征与深层特征。"""
-        low_level_features = self.features[:4](x)
-        x = self.features[4:](low_level_features)
-        return low_level_features, x
+        return F.conv2d(x, self.weight*self.mask, padding=self.padding)
 
 
-class _DenseASPPBlock(nn.Module):
-    """使用可分离空洞卷积生成新特征，并与输入沿通道维拼接。"""
-
-    def __init__(self, in_channels, inter_channels, growth_rate, dilation_rate, drop_rate=0.1):
-        super(_DenseASPPBlock, self).__init__()
-        self.conv1 = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, inter_channels, 1, bias=False)
-        )
-
-        # 使用可分离卷积减少参数量
-        self.conv2 = nn.Sequential(
-            nn.BatchNorm2d(inter_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(inter_channels, inter_channels, 3, padding=dilation_rate,
-                      dilation=dilation_rate, groups=inter_channels, bias=False),
-            nn.Conv2d(inter_channels, growth_rate, 1, bias=False)
-        )
-        self.drop_rate = drop_rate
+class DGG(nn.Module):
+    """Four directional branches; concatenate -> 1x1 fusion -> BN -> ReLU."""
+    def __init__(self, channels=48, kernel=7):
+        super().__init__()
+        if channels % 4:
+            raise ValueError("DGG channels must be divisible by four")
+        quarter = channels // 4
+        self.branches = nn.ModuleList([
+            nn.Conv2d(channels, quarter, (1,kernel), padding=(0,kernel//2), bias=False),
+            nn.Conv2d(channels, quarter, (kernel,1), padding=(kernel//2,0), bias=False),
+            DiagonalConv(channels, quarter, kernel),
+            DiagonalConv(channels, quarter, kernel, anti=True),
+        ])
+        self.fusion = ConvBNReLU(channels, channels)
 
     def forward(self, x):
-        output = self.conv1(x)
-        output = self.conv2(output)
-        if self.drop_rate > 0:
-            output = F.dropout2d(output, p=self.drop_rate, training=self.training)
-        return torch.cat([x, output], 1)
+        return self.fusion(torch.cat([branch(x) for branch in self.branches], dim=1))
 
 
-class CrackAwareDenseASPP(nn.Module):
-    """密集堆叠多尺度空洞卷积，并通过裂缝注意力增强融合特征。"""
+class TDE(nn.Module):
+    """Text Eq.5: I is each channel of the incoming high-level feature.
 
-    def __init__(self, in_channels, out_channels, inter_channels=64, growth_rate=32,
-                 dilation_series=[3, 6, 12, 18, 24]):
-        super(CrackAwareDenseASPP, self).__init__()
+    Wt=sigmoid(alpha*abs(I-local_mean(I))); output=I*Wt, no residual blend.
+    """
+    def __init__(self):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(1.0))
 
-        # 依次提取特征并加入裂缝感知处理。
-        self.blocks = nn.ModuleList()
-        channels = in_channels
-
-        # 构建DenseASPP块
-        for dilation in dilation_series:
-            self.blocks.append(
-                _DenseASPPBlock(channels, inter_channels, growth_rate, dilation_rate=dilation)
-            )
-            channels += growth_rate
-
-        # 累计输入通道与各密集块新增的通道。
-        final_channels = channels
-        print(f"DenseASPP final channels: {final_channels}")  # 调试信息
-
-        # 将密集拼接特征映射到目标通道数。
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(final_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-
-        # 添加裂缝注意力
-        self.crack_attention = CrackAttentionModule(out_channels)
-
-        self.msfe_save_dir = os.path.join("img", "MSFE")
-        os.makedirs(self.msfe_save_dir, exist_ok=True)
-        self._msfe_index = 0
-
-    def _save_msfe_heatmap(self, fmaps, name_prefix, idx_suffix):
-        """保存首个样本的 DenseASPP 多尺度堆叠特征热力图。"""
-        with torch.no_grad():
-            comp = fmaps.detach().abs().mean(dim=1, keepdim=True)[0, 0]  # [H,W]
-            minv, maxv = float(comp.min()), float(comp.max())
-            if maxv > minv:
-                comp = (comp - minv) / (maxv - minv + 1e-6)
-            else:
-                comp = torch.zeros_like(comp)
-            comp_np = (comp.cpu().numpy() * 255.0).astype(np.uint8)
-            heatmap = cv2.applyColorMap(comp_np, cv2.COLORMAP_JET)
-            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-            Image.fromarray(heatmap).save(
-                os.path.join(self.msfe_save_dir, f"{name_prefix}{idx_suffix}.png")
-            )
+    def weights(self, x):
+        mean = F.avg_pool2d(F.pad(x, (1,1,1,1), mode="replicate"), 3, stride=1)
+        return torch.sigmoid(self.alpha * (x-mean).abs())
 
     def forward(self, x):
-        # 依次通过所有DenseASPP块
-        """堆叠多尺度特征，经通道融合和裂缝注意力后输出。"""
+        return x * self.weights(x)
+
+
+class MFEM(nn.Module):
+    """BPU -> middle-scale fusion + IRB -> DGG -> fine-scale fusion + IRB -> TDE.
+
+    Explicit adapters resolve missing cross-scale operators in Fig.2.
+    Flow is the resized/projected BPU branch in Fig.1; Fhigh is 96 channels at /16.
+    """
+    def __init__(self):
+        super().__init__()
+        self.bpu = BPU(96)
+        self.low_adapter = ConvBNReLU(96, 24)
+        self.middle_fusion = nn.Sequential(ConvBNReLU(96+48, 48), InvertedResidual(48,48))
+        self.dgg = DGG(48)
+        self.fine_fusion = nn.Sequential(ConvBNReLU(48+24, 24), InvertedResidual(24,24))
+        self.high_adapter = ConvBNReLU(24, 96)
+        self.tde = TDE()
+
+    def forward(self, f0, f1, f2):
+        boundary = self.bpu(f0)
+        low = self.low_adapter(resize(boundary, f2.shape[-2:]))
+        middle = self.middle_fusion(torch.cat((resize(boundary, f1.shape[-2:]), f1), dim=1))
+        directional = self.dgg(middle)
+        fine = self.fine_fusion(torch.cat((resize(directional, f2.shape[-2:]), f2), dim=1))
+        high_input = self.high_adapter(F.adaptive_avg_pool2d(fine, f0.shape[-2:]))
+        return low, self.tde(high_input)
+
+
+class MSFE(nn.Module):
+    """Eq.6: each ordinary dilated 3x3 sees all previous outputs plus H0."""
+    def __init__(self, cin=96, cout=256, growth=32, rates=(3,6,12,18,24)):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            ConvBNReLU(cin+i*growth, growth, 3, dilation=rate)
+            for i, rate in enumerate(rates)
+        ])
+        self.fusion = ConvBNReLU(cin+len(rates)*growth, cout)
+
+    def forward(self, x):
+        features = [x]
         for block in self.blocks:
-            x = block(x)
-
-        # 保存全部 DenseASPP 块堆叠后的 MSFE 特征。
-        idx_suffix = f"_{self._msfe_index:06d}"
-        self._save_msfe_heatmap(x, "MSFE_output", idx_suffix)
-        self._msfe_index += 1
-
-        # 融合特征
-        output = self.fusion_conv(x)
-
-        # 应用裂缝注意力
-        output = self.crack_attention(output)
-
-        return output
+            features.append(block(torch.cat(features, dim=1)))
+        return self.fusion(torch.cat(features, dim=1))
 
 
-class EnhancedFeatureFusion(nn.Module):
-    """对齐并融合高低层特征，使用边缘权重调制融合结果。"""
-
-    def __init__(self, high_channels, low_channels, out_channels):
-        super(EnhancedFeatureFusion, self).__init__()
-
-        # 低层特征处理
-        self.low_conv = nn.Sequential(
-            nn.Conv2d(low_channels, 48, 1),
-            nn.BatchNorm2d(48),
-            nn.ReLU(inplace=True)
-        )
-
-        # 高层特征处理
-        self.high_conv = nn.Sequential(
-            nn.Conv2d(high_channels, 256, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-
-        # 多尺度融合
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(48 + 256, out_channels, 3, stride=1, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-
-            nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-        )
-
-        # 边缘增强分支
-        self.edge_branch = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels // 4, 3, padding=1),
-            nn.BatchNorm2d(out_channels // 4),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels // 4, out_channels, 3, padding=1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, high_feat, low_feat):
-        # 处理低层特征
-        """将高层特征上采样到低层尺寸，融合后应用边缘权重。"""
-        low_feat = self.low_conv(low_feat)
-
-        # 处理高层特征
-        high_feat = self.high_conv(high_feat)
-
-        # 上采样高层特征并融合
-        high_feat = F.interpolate(high_feat, size=(low_feat.size(2), low_feat.size(3)),
-                                  mode='bilinear', align_corners=True)
-
-        # 特征融合
-        fused_feat = torch.cat([high_feat, low_feat], dim=1)
-        output = self.fusion_conv(fused_feat)
-
-        # 边缘增强
-        edge_weight = self.edge_branch(output)
-        output = output * edge_weight
-
-        return output
-
-
-class DenseASPP(nn.Module):
-    """密集连接多尺度空洞卷积，并将拼接特征映射到指定通道数。"""
-
-    def __init__(self, in_channels, out_channels, inter_channels=64, growth_rate=32,
-                 dilation_series=[3, 6, 12, 18, 24]):
-        super(DenseASPP, self).__init__()
-        self.blocks = nn.ModuleList()
-        channels = in_channels
-        for dilation in dilation_series:
-            self.blocks.append(
-                _DenseASPPBlock(channels, inter_channels, growth_rate, dilation_rate=dilation)
-            )
-            channels += growth_rate
-        self.conv_out = nn.Sequential(
-            nn.Conv2d(channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+class HSA(nn.Module):
+    """Eqs.7-8: shared MLP(GAP)+MLP(GMP), then spatial mean/max and 7x7."""
+    def __init__(self, channels=256, reduction=16):
+        super().__init__()
+        hidden = max(1, channels//reduction)
+        self.shared_mlp = nn.Sequential(nn.Conv2d(channels,hidden,1), nn.ReLU(),
+                                        nn.Conv2d(hidden,channels,1))
+        self.spatial = nn.Conv2d(2,1,7,padding=3,bias=False)
 
     def forward(self, x):
-        for block in self.blocks:
-            x = block(x)
-        x = self.conv_out(x)
-        return x
+        wc = torch.sigmoid(self.shared_mlp(F.adaptive_avg_pool2d(x,1)) +
+                           self.shared_mlp(F.adaptive_max_pool2d(x,1)))
+        channel_feature = x * wc
+        spatial_input = torch.cat((channel_feature.mean(1,keepdim=True),
+                                    channel_feature.amax(1,keepdim=True)), dim=1)
+        ws = torch.sigmoid(self.spatial(spatial_input))
+        return channel_feature * ws
 
 
-class MPFEN(nn.Module):
-    """MPFEN 分割网络，支持 MobileNetV2 和 Xception 骨干。"""
-
-    def __init__(self, num_classes=1, backbone="mobilenet", pretrained=True,
-                 downsample_factor=16, use_crack_aware=True):
-        super(MPFEN, self).__init__()
-
-        self.use_crack_aware = use_crack_aware
-
-        if backbone == "xception":
-            self.backbone = xception(downsample_factor=downsample_factor, pretrained=pretrained)
-            in_channels = 2048
-            low_level_channels = 256
-        elif backbone == "mobilenet":
-            self.backbone = MobileNetV2(downsample_factor=downsample_factor, pretrained=pretrained)
-            in_channels = 320
-            low_level_channels = 24
-        else:
-            raise ValueError('Unsupported backbone - `{}`, Use mobilenet, xception.'.format(backbone))
-
-        print(f"Backbone input channels: {in_channels}")  # 调试信息
-
-        # 按配置选择裂缝感知或基础 DenseASPP。
-        if use_crack_aware:
-            self.aspp = CrackAwareDenseASPP(
-                in_channels=in_channels,
-                out_channels=256,
-                inter_channels=64,
-                growth_rate=32,
-                dilation_series=[3, 6, 12, 18, 24]
-            )
-        else:
-            # 使用基础 DenseASPP 提取多尺度特征。
-            self.aspp = DenseASPP(
-                in_channels=in_channels,
-                out_channels=256,
-                inter_channels=64,
-                growth_rate=32,
-                dilation_series=[3, 6, 12, 18, 24]
-            )
-
-        # 使用 SEBlock 调制通道响应。
-        self.se_block = SEBlock(256, reduction=16)
-
-        # 使用增强的特征融合模块
-        if use_crack_aware:
-            self.feature_fusion = EnhancedFeatureFusion(
-                high_channels=256,
-                low_channels=low_level_channels,
-                out_channels=256
-            )
-        else:
-            # 使用通道压缩、拼接与卷积完成基础特征融合。
-            self.shortcut_conv = nn.Sequential(
-                nn.Conv2d(low_level_channels, 48, 1),
-                nn.BatchNorm2d(48),
-                nn.ReLU(inplace=True)
-            )
-            self.cat_conv = nn.Sequential(
-                nn.Conv2d(48 + 256, 256, 3, stride=1, padding=1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True),
-                nn.Dropout(0.5),
-
-                nn.Conv2d(256, 256, 3, stride=1, padding=1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True),
-                nn.Dropout(0.1),
-            )
-
-        # 最终分类层
-        self.cls_conv = nn.Conv2d(256, num_classes, 1, stride=1)
-
-    def forward(self, x):
-        """提取并融合多尺度特征，输出与输入空间尺寸一致的分割 logits。"""
-        H, W = x.size(2), x.size(3)
-
-        # 主干提取特征
-        low_level_features, high_level_features = self.backbone(x)
+class LCFFEM(nn.Sequential):
+    def __init__(self):
+        super().__init__(MSFE(), HSA())
 
 
-        # 使用 DenseASPP 提取深层多尺度特征。
-        aspp_features = self.aspp(high_level_features)
+class EGFFM(nn.Module):
+    """Eqs.9-11: low-feature Sobel -> Norm -> gate upsampled deep -> cat low + residual."""
+    def __init__(self, low_channels=24, deep_channels=256, out_channels=256):
+        super().__init__()
+        self.sobel = SobelMagnitude()
+        self.fusion = nn.Sequential(ConvBNReLU(low_channels+deep_channels,out_channels,3),
+                                     ConvBNReLU(out_channels,out_channels,3))
+        self.residual = nn.Conv2d(low_channels,out_channels,1,bias=False)
 
-        # 应用 SEBlock 通道注意力。
-        aspp_features = self.se_block(aspp_features)
+    def edge_weights(self, low):
+        magnitude = self.sobel(low).mean(1,keepdim=True)
+        minimum = magnitude.amin(dim=(-2,-1),keepdim=True)
+        maximum = magnitude.amax(dim=(-2,-1),keepdim=True)
+        return (magnitude-minimum)/(maximum-minimum).clamp_min(1e-6)
 
-        # 特征融合
-        if self.use_crack_aware:
-            # 使用增强的特征融合
-            fused_features = self.feature_fusion(aspp_features, low_level_features)
-        else:
-            # 使用基础特征融合分支。
-            low_level_features = self.shortcut_conv(low_level_features)
-            aspp_features = F.interpolate(aspp_features,
-                                          size=(low_level_features.size(2), low_level_features.size(3)),
-                                          mode='bilinear', align_corners=True)
-            fused_features = self.cat_conv(torch.cat((aspp_features, low_level_features), dim=1))
-
-        # 最终分类
-        output = self.cls_conv(fused_features)
-
-        # 上采样到原始尺寸
-        output = F.interpolate(output, size=(H, W), mode='bilinear', align_corners=True)
-
-        return output
+    def forward(self, low, deep):
+        deep_attention = resize(deep, low.shape[-2:]) * self.edge_weights(low)
+        return self.fusion(torch.cat((low, deep_attention),dim=1)) + self.residual(low)
 
 
-def create_crack_aware_mpfen(num_classes=1, backbone="mobilenet", pretrained=True, downsample_factor=16):
-    """创建启用裂缝注意力和增强特征融合的 MPFEN。"""
-    return MPFEN(num_classes=num_classes, backbone=backbone,
-                   pretrained=pretrained, downsample_factor=downsample_factor,
-                   use_crack_aware=True)
+class PlainFusion(nn.Module):
+    """Ablation replacement: same output shape without Sobel gating or low residual."""
+    def __init__(self):
+        super().__init__()
+        self.fusion = nn.Sequential(ConvBNReLU(24+256,256,3),ConvBNReLU(256,256,3))
+
+    def forward(self, low, deep):
+        return self.fusion(torch.cat((low,resize(deep,low.shape[-2:])),dim=1))
 
 
-def create_standard_mpfen(num_classes=1, backbone="mobilenet", pretrained=True, downsample_factor=16):
-    """创建使用基础 DenseASPP 和基础特征融合的 MPFEN。"""
-    return MPFEN(num_classes=num_classes, backbone=backbone,
-                   pretrained=pretrained, downsample_factor=downsample_factor,
-                   use_crack_aware=False)
+class MPFENLWTYPE(nn.Module):
+    architecture = "MPFEN-LWTYPE-text-v1"
+
+    def __init__(self, num_classes=2, use_mfem=True, use_lcffem=True, use_egffm=True):
+        super().__init__()
+        if num_classes < 2:
+            raise ValueError("Use >=2 logits for CE; binary segmentation uses two classes")
+        self.config = dict(num_classes=num_classes, use_mfem=use_mfem,
+                           use_lcffem=use_lcffem, use_egffm=use_egffm)
+        self.backbone = PaperBackbone()
+        self.mfem = MFEM() if use_mfem else None
+        self.lcffem = LCFFEM() if use_lcffem else ConvBNReLU(96,256)
+        self.decoder = EGFFM() if use_egffm else PlainFusion()
+        self.classifier = nn.Conv2d(256,num_classes,1)
+
+    def forward(self, x, return_features=False):
+        if x.ndim != 4 or x.shape[1] != 3:
+            raise ValueError("Expected NCHW RGB input")
+        f0, f1, f2 = self.backbone(x)
+        low, high = self.mfem(f0,f1,f2) if self.mfem is not None else (f2,f0)
+        deep = self.lcffem(high)
+        fused = self.decoder(low,deep)
+        logits = resize(self.classifier(fused),x.shape[-2:])
+        if return_features:
+            return logits, dict(F0=f0,F1=f1,F2=f2,F_low=low,F_high=high,F_deep=deep,F_fused=fused)
+        return logits
+
+
+class MPFEN(MPFENLWTYPE):
+    """Paper architecture behind the unchanged repository training/prediction API.
+
+    downsample_factor is retained for call compatibility; paper scales are fixed
+    at 1/16, 1/8 and 1/4. Both legacy values construct identical checkpoints.
+    """
+    def __init__(self, num_classes=2, backbone="mobilenet", pretrained=False,
+                 downsample_factor=16, use_crack_aware=True,
+                 use_directional=True, use_texture=True):
+        if backbone != "mobilenet":
+            raise ValueError("The confirmed paper architecture uses mobilenet only")
+        if pretrained:
+            raise ValueError("No compatible pretrained paper-backbone weights; use pretrained=False")
+        if downsample_factor not in (8,16):
+            raise ValueError("Legacy downsample_factor must be 8 or 16")
+        super().__init__(num_classes=num_classes,use_mfem=use_crack_aware,
+                         use_lcffem=use_crack_aware,use_egffm=use_crack_aware)
+        self.use_crack_aware=use_crack_aware
+        self.use_directional=use_directional and use_crack_aware
+        self.use_texture=use_texture and use_crack_aware
+        self.requested_downsample_factor=downsample_factor
+        self.effective_downsample_factor=16
+        if self.mfem is not None:
+            if not use_directional:self.mfem.dgg=nn.Identity()
+            if not use_texture:self.mfem.tde=nn.Identity()
+
+
+def create_crack_aware_mpfen(num_classes=2, backbone="mobilenet", pretrained=False,
+                            downsample_factor=16,use_directional=True,use_texture=True):
+    return MPFEN(num_classes,backbone,pretrained,downsample_factor,True,use_directional,use_texture)
+
+
+def create_standard_mpfen(num_classes=2, backbone="mobilenet", pretrained=False,downsample_factor=16):
+    return MPFEN(num_classes,backbone,pretrained,downsample_factor,False)

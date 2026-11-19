@@ -1,0 +1,177 @@
+{
+  "base_package": "MPFEN_当前论文网络_20261119.zip",
+  "removed": [
+    "GeoCrack量化评估-使用说明.txt",
+    "boundary_val/放入数据说明.txt",
+    "evaluate_boundary_M6_Full.py",
+    "evaluate_geocrack.py",
+    "getpara.py",
+    "nets/__pycache__/__init__.cpython-310.pyc",
+    "nets/__pycache__/mpfen.cpython-310.pyc",
+    "summary.py",
+    "train_M4.py",
+    "train_M5.py",
+    "train_M6.py",
+    "仅网络结构修改核对-FINAL.json",
+    "边界评测-M6-Full-使用说明.txt"
+  ],
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 44,
+      "sha256": "11e5dc119ec72ca2dac377c249ceae3668e3e431e894d2138ed51ae1508594ac"
+    },
+    {
+      "path": "00-版本说明.txt",
+      "bytes": 1820,
+      "sha256": "04b5fe688040456e5ea3eb4a9472462eb3860cdaa9d06380a85f5b834674bb38"
+    },
+    {
+      "path": "Conda从零安装-清华源-CUDA.txt",
+      "bytes": 5042,
+      "sha256": "c12aabada8d8915e2d9c5ef86b19aa8c1fa642417d81478b23da634e20214e0a"
+    },
+    {
+      "path": "get_miou.py",
+      "bytes": 2030,
+      "sha256": "aa6244c8d7254ca468ba5d6bb3eca42f3d4fd9bee0730e87bf96eba8f879b0f4"
+    },
+    {
+      "path": "img/img.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "json_to_dataset.py",
+      "bytes": 3220,
+      "sha256": "b31d47b6f8c054fd4dd6bd11192b633c8ec49f3ecfd1050476b806a5fd57df24"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1068,
+      "sha256": "70a3b3040cbd14f16681633009387abd7fb1d9f7b5dfe83c3cefb621c659fb15"
+    },
+    {
+      "path": "logs/img.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "miou_out/img.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "model_data/txt.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "mpfen.py",
+      "bytes": 13398,
+      "sha256": "e85a8b2f2f42f7db6274bf753b6c61d9b84f3d3fdf264a6f998c0746701f05cb"
+    },
+    {
+      "path": "nets/__init__.py",
+      "bytes": 48,
+      "sha256": "638bef90a822ce2d0110b5689a644228acdf6f5fb7b9864bb6394636a1127d52"
+    },
+    {
+      "path": "nets/aco_optimizer.py",
+      "bytes": 6982,
+      "sha256": "9dcbd7b1f528b488a1010fe8cea3d051ce3ecaf8f7a183ddc44e57a62a1d8391"
+    },
+    {
+      "path": "nets/mpfen.py",
+      "bytes": 13329,
+      "sha256": "229067a524e13c9fa40423517d3642b9472a44840fd973cc0b496b7895fa24a0"
+    },
+    {
+      "path": "nets/mpfen_training.py",
+      "bytes": 5339,
+      "sha256": "b18c85696d98a0ec2ac7660c03ea72463ae5da9884bd92c99326e8f20c1de2bd"
+    },
+    {
+      "path": "network-verification.json",
+      "bytes": 992,
+      "sha256": "ca28da10fd67d133038bbe795d5dba7ad68a5730203e1d47985c0a889763e711"
+    },
+    {
+      "path": "predict.py",
+      "bytes": 6288,
+      "sha256": "0546d8a0a96aaabc2db7e6c6330a4fdfae4d5f65e26172cedeeb6906b2b73565"
+    },
+    {
+      "path": "predict2.py",
+      "bytes": 8309,
+      "sha256": "818c87017a84ffadf77bd5f7e2aa5109dab61bf7051c06f350f6d1db0785936a"
+    },
+    {
+      "path": "requirments2.txt",
+      "bytes": 4482,
+      "sha256": "c8e8f5e144b9209085297c695c158a41c6177de51dd660c0ce754fa1985522f8"
+    },
+    {
+      "path": "train.py",
+      "bytes": 16911,
+      "sha256": "c7010f93561b5335ad3bbcebb55785d4e32b5f7e8d479bec85dd076e3286ddda"
+    },
+    {
+      "path": "utils/__init__.py",
+      "bytes": 54,
+      "sha256": "d62d8f51170edefb0495a397d334fdd2adbb9f219d6c3009395d81fbcf48bd9e"
+    },
+    {
+      "path": "utils/callbacks.py",
+      "bytes": 7167,
+      "sha256": "1515aafd1e2e8426289c056d674d5a90acf351f89e1055668b575dfdf33ee6e7"
+    },
+    {
+      "path": "utils/dataloader.py",
+      "bytes": 6272,
+      "sha256": "839425434ff173130ff44e7d6863d03b62b4eb4a9910759f0c2f5e7d814dbc8a"
+    },
+    {
+      "path": "utils/lovasz-soft.py",
+      "bytes": 61,
+      "sha256": "30e88aa881ef51faca70db26b1f2e307516843c86a40bd9205289766ba4eb7da"
+    },
+    {
+      "path": "utils/utils.py",
+      "bytes": 2711,
+      "sha256": "959d860a96d1172920dc45577741634b63df013e62044f87248468fa65852a58"
+    },
+    {
+      "path": "utils/utils_fit.py",
+      "bytes": 5760,
+      "sha256": "10c198acb0d089af2572f2e59b58786395617976f72e13d0b53470c33c7e0fc8"
+    },
+    {
+      "path": "utils/utils_metrics.py",
+      "bytes": 7797,
+      "sha256": "fb921b541f381e6b49e4886457d80e6189e4f4e931f8f118ba4e04602db8edab"
+    },
+    {
+      "path": "voc_annotation.py",
+      "bytes": 4185,
+      "sha256": "f38cff9d52325543ef99c0adc9ac15649ca0bd3d30598623e03c8646a05b081e"
+    },
+    {
+      "path": "zmy-get_miou.py",
+      "bytes": 3961,
+      "sha256": "6ba4fdfbf8eda9eef7a431e5076d4529958aef14ac1a76d3229f79bd001c3f89"
+    },
+    {
+      "path": "使用说明-FINAL.txt",
+      "bytes": 2446,
+      "sha256": "1ccaccc787e04d886f05af3940286cc54f397a0c4a950a451b7fd0c7ec19065b"
+    },
+    {
+      "path": "安装环境-Windows清华源-FINAL.txt",
+      "bytes": 1577,
+      "sha256": "01b02b7143357c4f3749e1dc1d829620438680909a856db9d6edc2a5fd06abbb"
+    }
+  ],
+  "python_files_unchanged": 19,
+  "network_source_unchanged": true
+}

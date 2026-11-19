@@ -1,0 +1,67 @@
+{
+  "purpose": "CPU tensor-path and gradient check; not a dataset evaluation",
+  "torch": "2.4.1+cpu",
+  "device": "cpu",
+  "model_sha256": "229067a524e13c9fa40423517d3642b9472a44840fd973cc0b496b7895fa24a0",
+  "parameters": 2231605,
+  "features": {
+    "F0": [
+      1,
+      96,
+      32,
+      32
+    ],
+    "F1": [
+      1,
+      48,
+      64,
+      64
+    ],
+    "F2": [
+      1,
+      24,
+      128,
+      128
+    ],
+    "F_low": [
+      1,
+      24,
+      128,
+      128
+    ],
+    "F_high": [
+      1,
+      96,
+      32,
+      32
+    ],
+    "F_deep": [
+      1,
+      256,
+      32,
+      32
+    ],
+    "F_fused": [
+      1,
+      256,
+      128,
+      128
+    ]
+  },
+  "output": [
+    1,
+    2,
+    512,
+    512
+  ],
+  "module_calls": {
+    "bpu": 1,
+    "dgg": 1,
+    "tde": 1,
+    "lcffem": 1,
+    "decoder": 1
+  },
+  "finite_forward": true,
+  "finite_gradients_all_parameters": true,
+  "optimizer_step": "passed"
+}
